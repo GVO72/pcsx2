@@ -179,6 +179,28 @@ namespace Oracle
 			return false;
 		}
 
+		// OutputDir comes first, so that every later failure still ends with a status.json.
+		if (!si.GetStringValue(SECTION, "OutputDir", &spec->output_dir) || spec->output_dir.empty())
+		{
+			*err = "spec: missing required key 'OutputDir'";
+			return false;
+		}
+		if (!Path::IsAbsolute(spec->output_dir))
+		{
+			*err = fmt::format("spec: OutputDir '{}' is not an absolute path", spec->output_dir);
+			return false;
+		}
+		Error dir_error;
+		if (!FileSystem::EnsureDirectoryExists(spec->output_dir.c_str(), true, &dir_error))
+		{
+			*err = fmt::format("spec: cannot create OutputDir '{}': {}", spec->output_dir, dir_error.GetDescription());
+			return false;
+		}
+		{
+			std::lock_guard lock(s_mutex);
+			s_output_dir = spec->output_dir; // from here on status.json can be written, whatever fails later
+		}
+
 		// INISettingsInterface cannot list sections, so use the INI reader it is built on.
 		{
 			CSimpleIniA ini(true, true);
@@ -228,27 +250,6 @@ namespace Oracle
 		{
 			*err = fmt::format("spec: unsupported Version {} (expected 1)", spec->version);
 			return false;
-		}
-
-		if (!si.GetStringValue(SECTION, "OutputDir", &spec->output_dir) || spec->output_dir.empty())
-		{
-			*err = "spec: missing required key 'OutputDir'";
-			return false;
-		}
-		if (!Path::IsAbsolute(spec->output_dir))
-		{
-			*err = fmt::format("spec: OutputDir '{}' is not an absolute path", spec->output_dir);
-			return false;
-		}
-		Error dir_error;
-		if (!FileSystem::EnsureDirectoryExists(spec->output_dir.c_str(), true, &dir_error))
-		{
-			*err = fmt::format("spec: cannot create OutputDir '{}': {}", spec->output_dir, dir_error.GetDescription());
-			return false;
-		}
-		{
-			std::lock_guard lock(s_mutex);
-			s_output_dir = spec->output_dir; // from here on status.json can be written
 		}
 
 		if (!ParseIntKey(si, "EndFrame", true, &spec->end_frame, err))
@@ -388,13 +389,6 @@ namespace Oracle
 		if (version != std::string_view::npos)
 			path = path.substr(0, version);
 		return path;
-	}
-
-	static void WriteFile(const char* name, std::string_view contents)
-	{
-		const std::string path = Path::Combine(s_spec.output_dir, name);
-		if (!FileSystem::WriteStringToFile(path.c_str(), contents))
-			Fail(fmt::format("could not write '{}'", path));
 	}
 
 	// The effective configuration once the game database has applied its settings, in PCSX2.ini form.
@@ -604,7 +598,6 @@ namespace Oracle
 			// Requesting the shutdown from the CPU thread only sets a flag: the rest of this vsync
 			// still runs, so this frame reaches the GS thread before execution stops.
 			s_end_frame_reached.store(true, std::memory_order_release);
-			WriteFile("elf.tsv", s_elf_log);
 			Console.WriteLn("Oracle: EndFrame %d reached, shutting down", frame);
 			Host::RequestVMShutdown(false, false, false);
 		}
@@ -761,12 +754,32 @@ namespace Oracle
 		return out;
 	}
 
+	// elf.tsv, once, on every exit path (it is empty if no ELF started).
+	static void WriteElfLog()
+	{
+		static bool written = false;
+		{
+			std::lock_guard lock(s_mutex);
+			if (written || s_output_dir.empty())
+				return;
+			written = true;
+		}
+
+		const std::string path = Path::Combine(s_spec.output_dir, "elf.tsv");
+		if (!FileSystem::WriteStringToFile(path.c_str(), s_elf_log))
+		{
+			Console.Error("Oracle: FAIL: could not write '%s'", path.c_str());
+			RecordFailure(fmt::format("could not write '{}'", path));
+		}
+	}
+
 	// Writes status.json once. Must be the last thing the oracle writes.
 	static void WriteStatus()
 	{
 		if (!s_end_frame_reached.load(std::memory_order_acquire))
 			RecordFailure("VM stopped before EndFrame was reached");
 
+		WriteElfLog();
 		WriteConsoleFiles(); // before status.json, which must be the last file written
 
 		std::lock_guard lock(s_mutex);
