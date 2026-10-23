@@ -10,6 +10,7 @@
 #include "GS/GSPerfMon.h"
 #include "GS/GSUtil.h"
 #include "GSDumpReplayer.h"
+#include "Oracle.h"
 #include "Host.h"
 #include "PerformanceMetrics.h"
 #include "pcsx2/Config.h"
@@ -631,6 +632,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 	}
 
 	const bool blank_frame = !Merge(field);
+	if (Oracle::IsEnabled())
+		Oracle::OnGSVSync(*this, blank_frame);
 
 	m_last_draw_n = s_n;
 	m_last_transfer_n = s_transfer_n;

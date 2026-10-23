@@ -10,6 +10,11 @@
 #include "IopMem.h"
 #include "ImGui/FullscreenUI.h"
 #include "INISettingsInterface.h"
+#include "GS/GS.h"
+#include "GS/Renderers/Common/GSDevice.h"
+#include "GS/Renderers/Common/GSRenderer.h"
+#include "GS/Renderers/Common/GSTexture.h"
+#include "MTGS.h"
 #include "Memory.h"
 #include "MemoryTypes.h"
 #include "R3000A.h"
@@ -20,6 +25,8 @@
 
 #include "common/Console.h"
 #include "common/FileSystem.h"
+#include "common/Image.h"
+#include "common/MD5Digest.h"
 #include "common/Path.h"
 #include "common/SettingsWrapper.h"
 #include "common/StringUtil.h"
@@ -72,6 +79,14 @@ namespace Oracle
 	static int s_next_frame = 0;
 	static std::string s_elf_log; // elf.tsv: frame, entry point, path
 	static std::atomic_bool s_end_frame_reached{false};
+
+	// GS thread state. Set up by the frame-0 start message (the CPU thread waits for it), then only
+	// touched on the GS thread until shutdown waits for the GS thread again.
+	static bool s_gs_started = false;
+	static int s_gs_frame = 0;
+	static std::string s_frames_tsv; // frames.tsv: frame, width, height, MD5 of the canonical image or "blank"
+	static std::string s_video_mode = "unknown"; // GS video mode at EndFrame
+	static std::unique_ptr<GSDownloadTexture> s_download;
 
 	// Guest console capture. Written to ee-console.txt, iop-console.txt and console.tsv at shutdown.
 	// Guarded by s_console_mutex: the writers run on the CPU thread, but this does not rely on it.
@@ -363,10 +378,13 @@ namespace Oracle
 		if (!CheckSettings(&settings_error))
 			return SetFailure(error, fmt::format("settings: {}", settings_error.GetDescription()));
 
-		const std::string state_dir = Path::Combine(s_spec.output_dir, "state");
-		Error dir_error;
-		if (!FileSystem::EnsureDirectoryExists(state_dir.c_str(), false, &dir_error))
-			return SetFailure(error, fmt::format("cannot create '{}': {}", state_dir, dir_error.GetDescription()));
+		for (const char* subdir : {"state", "frames", "gs"})
+		{
+			const std::string dir = Path::Combine(s_spec.output_dir, subdir);
+			Error dir_error;
+			if (!FileSystem::EnsureDirectoryExists(dir.c_str(), false, &dir_error))
+				return SetFailure(error, fmt::format("cannot create '{}': {}", dir, dir_error.GetDescription()));
+		}
 
 		{
 			std::lock_guard lock(s_console_mutex);
@@ -585,6 +603,15 @@ namespace Oracle
 			}
 			WriteEffectiveConfig();
 			Console.WriteLn("Oracle: frame 0 (VM vsync count %u)", g_FrameCount);
+
+			// This vsync's frame has not been handed to the GS thread yet (that happens after this hook),
+			// so a message queued now runs just before frame 0 reaches the GS. Waiting for it makes the
+			// GS side start at exactly this frame.
+			MTGS::RunOnGSThread([]() {
+				s_gs_frame = 0;
+				s_gs_started = true;
+			});
+			MTGS::WaitGS(false, false, false);
 		}
 
 		if (std::binary_search(s_spec.checkpoints.begin(), s_spec.checkpoints.end(), frame))
@@ -600,6 +627,158 @@ namespace Oracle
 			s_end_frame_reached.store(true, std::memory_order_release);
 			Console.WriteLn("Oracle: EndFrame %d reached, shutting down", frame);
 			Host::RequestVMShutdown(false, false, false);
+		}
+	}
+
+	static const char* VideoModeName(GSVideoMode mode)
+	{
+		switch (mode)
+		{
+			case GSVideoMode::NTSC:
+				return "ntsc";
+			case GSVideoMode::PAL:
+				return "pal";
+			case GSVideoMode::VESA:
+				return "vesa";
+			case GSVideoMode::SDTV_480P:
+				return "480p";
+			case GSVideoMode::HDTV_720P:
+				return "720p";
+			case GSVideoMode::HDTV_1080I:
+				return "1080i";
+			default:
+				return "unknown";
+		}
+	}
+
+	// Copies a GS texture 1:1 to the CPU as RGBA8, one u32 per pixel (R in the low byte), rows top to
+	// bottom. No shader, no scaling, no cropping.
+	static bool DownloadImage(GSTexture* tex, std::vector<u32>* pixels)
+	{
+		if (tex->GetFormat() != GSTexture::Format::Color)
+			return false;
+
+		const u32 width = static_cast<u32>(tex->GetWidth());
+		const u32 height = static_cast<u32>(tex->GetHeight());
+		if (!s_download || s_download->GetWidth() != width || s_download->GetHeight() != height)
+		{
+			s_download = g_gs_device->CreateDownloadTexture(width, height, GSTexture::Format::Color);
+			if (!s_download)
+				return false;
+		}
+
+		const GSVector4i rc(0, 0, width, height);
+		s_download->CopyFromTexture(rc, tex, rc, 0);
+		s_download->Flush();
+		if (!s_download->Map(rc))
+			return false;
+		pixels->resize(static_cast<size_t>(width) * height);
+		StringUtil::StrideMemCpy(pixels->data(), width * sizeof(u32), s_download->GetMapPointer(),
+			s_download->GetMapPitch(), width * sizeof(u32), height);
+		s_download->Unmap();
+		return true;
+	}
+
+	// MD5 of the canonical image: R, G, B bytes per pixel, rows top to bottom, alpha dropped.
+	static std::string CanonicalImageMD5(const std::vector<u32>& pixels)
+	{
+		std::vector<u8> rgb;
+		rgb.reserve(pixels.size() * 3);
+		for (const u32 p : pixels)
+		{
+			rgb.push_back(static_cast<u8>(p));
+			rgb.push_back(static_cast<u8>(p >> 8));
+			rgb.push_back(static_cast<u8>(p >> 16));
+		}
+		MD5Digest md5;
+		md5.Update(rgb.data(), static_cast<u32>(rgb.size()));
+		u8 digest[16];
+		md5.Final(digest);
+		std::string hex;
+		for (const u8 b : digest)
+			hex += fmt::format("{:02x}", b);
+		return hex;
+	}
+
+	// frames/<frame>.png: the image with alpha forced opaque, so it shows what the canonical hash covers.
+	static void WriteFramePng(int frame, u32 width, u32 height, std::vector<u32> pixels)
+	{
+		for (u32& p : pixels)
+			p |= 0xFF000000u;
+		const RGBA8Image image(width, height, std::move(pixels));
+		const std::string path = Path::Combine(Path::Combine(s_spec.output_dir, "frames"), fmt::format("{}.png", frame));
+		if (!image.SaveToFile(path.c_str()))
+			Fail(fmt::format("could not write '{}'", path));
+	}
+
+	// gs/<frame>.bin: GS local memory (4 MB) followed by the privileged registers, raw.
+	static void WriteGSDump(int frame, GSRenderer& renderer)
+	{
+		std::string out;
+		out.reserve(GSLocalMemory::m_vmsize + sizeof(GSPrivRegSet));
+		out.append(reinterpret_cast<const char*>(renderer.m_mem.vm8()), GSLocalMemory::m_vmsize);
+		out.append(reinterpret_cast<const char*>(renderer.m_regs), sizeof(GSPrivRegSet));
+		const std::string path = Path::Combine(Path::Combine(s_spec.output_dir, "gs"), fmt::format("{}.bin", frame));
+		const std::string tmp_path = path + ".tmp";
+		if (!FileSystem::WriteStringToFile(tmp_path.c_str(), out) ||
+			!FileSystem::RenamePath(tmp_path.c_str(), path.c_str(), nullptr))
+			Fail(fmt::format("could not write GS dump '{}'", path));
+	}
+
+	void OnGSVSync(GSRenderer& renderer, bool blank_frame)
+	{
+		if (!s_gs_started || s_gs_frame > s_spec.end_frame)
+			return;
+
+		// One vsync message per EE vsync, so this counter matches the CPU thread's frame numbers.
+		const int frame = s_gs_frame++;
+		GSTexture* const current = g_gs_device->GetCurrent();
+		const bool blank = blank_frame || !current;
+
+		std::vector<u32> pixels;
+		u32 width = 0, height = 0;
+		if (!blank)
+		{
+			if (!DownloadImage(current, &pixels))
+			{
+				Fail(fmt::format("could not read back the displayed image at frame {}", frame));
+				return;
+			}
+			width = static_cast<u32>(current->GetWidth());
+			height = static_cast<u32>(current->GetHeight());
+		}
+		s_frames_tsv += fmt::format("{}\t{}\t{}\t{}\n", frame, width, height, blank ? "blank" : CanonicalImageMD5(pixels));
+
+		if (std::binary_search(s_spec.checkpoints.begin(), s_spec.checkpoints.end(), frame))
+		{
+			if (!blank)
+				WriteFramePng(frame, width, height, std::move(pixels));
+			WriteGSDump(frame, renderer);
+		}
+
+		if (frame == s_spec.end_frame)
+		{
+			s_video_mode = VideoModeName(renderer.GetVideoMode());
+			s_download.reset(); // GPU objects must go before the GS device does
+		}
+	}
+
+	// Writes frames.tsv, once, before status.json. Runs after the GS thread has gone idle.
+	static void WriteFramesLog()
+	{
+		static bool written = false;
+		{
+			std::lock_guard lock(s_mutex);
+			if (written || s_output_dir.empty())
+				return;
+			written = true;
+		}
+
+		const std::string path = Path::Combine(s_spec.output_dir, "frames.tsv");
+		if (!FileSystem::WriteStringToFile(path.c_str(), s_frames_tsv))
+		{
+			Console.Error("Oracle: FAIL: could not write '%s'", path.c_str());
+			RecordFailure(fmt::format("could not write '{}'", path));
 		}
 	}
 
@@ -780,6 +959,7 @@ namespace Oracle
 			RecordFailure("VM stopped before EndFrame was reached");
 
 		WriteElfLog();
+		WriteFramesLog();
 		WriteConsoleFiles(); // before status.json, which must be the last file written
 
 		std::lock_guard lock(s_mutex);
@@ -794,8 +974,9 @@ namespace Oracle
 		}
 
 		const bool failed = s_failed.load(std::memory_order_acquire);
-		const std::string json = fmt::format("{{\"version\": 1, \"result\": \"{}\", \"reason\": \"{}\"}}\n",
-			failed ? "failed" : "ok", JsonEscape(s_fail_reason));
+		const std::string json =
+			fmt::format("{{\"version\": 1, \"result\": \"{}\", \"reason\": \"{}\", \"video_mode\": \"{}\"}}\n",
+				failed ? "failed" : "ok", JsonEscape(s_fail_reason), s_video_mode);
 		const std::string path = Path::Combine(s_output_dir, "status.json");
 		if (!FileSystem::WriteStringToFile(path.c_str(), json))
 		{
@@ -809,6 +990,13 @@ namespace Oracle
 
 	void OnVMShutdown()
 	{
+		// Release the GS thread's GPU objects while the GS device still exists (on a failure before
+		// EndFrame they are still held).
+		MTGS::RunOnGSThread([]() {
+			s_gs_started = false;
+			s_download.reset();
+		});
+		MTGS::WaitGS(false, false, false);
 		WriteStatus();
 	}
 

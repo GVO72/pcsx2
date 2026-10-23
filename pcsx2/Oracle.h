@@ -9,6 +9,8 @@
 #include <string>
 #include <string_view>
 
+class GSRenderer;
+
 /// Oracle mode: a deterministic, headless run that is driven by a spec file (-oracle <spec.ini>).
 /// Without -oracle nothing in here is active and PCSX2 behaves exactly as upstream.
 namespace Oracle
@@ -39,6 +41,11 @@ namespace Oracle
 	/// Called on the CPU thread at every EE vsync, before the frame is handed to the GS thread.
 	/// Counts boot vsyncs until the anchor, then oracle frames, and stops the VM after EndFrame.
 	void OnVSyncCPU();
+
+	/// Called on the GS thread at every vsync, right after the displayed image has been merged. From the
+	/// frame-0 start message on, records each frame's image hash in frames.tsv, and at checkpoints
+	/// writes the image as PNG plus the GS memory and registers.
+	void OnGSVSync(GSRenderer& renderer, bool blank_frame);
 
 	/// Called for every piece of text the guest writes to its EE or IOP console (prefix "EEout",
 	/// "DECI2" or "IOPout"), after PCSX2's character set conversion. Safe to call from any thread.
