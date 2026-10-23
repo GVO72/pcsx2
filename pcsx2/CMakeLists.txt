@@ -92,6 +92,7 @@ set(pcsx2Sources
 	MMI.cpp
 	MTGS.cpp
 	MTVU.cpp
+	Oracle.cpp
 	Patch.cpp
 	Pcsx2Config.cpp
 	PerformanceMetrics.cpp
@@ -171,6 +172,7 @@ set(pcsx2Headers
 	Mdec.h
 	MTGS.h
 	MTVU.h
+	Oracle.h
 	Memory.h
 	MemoryTypes.h
 	Patch.h

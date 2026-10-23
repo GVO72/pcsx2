@@ -30,6 +30,7 @@
 #include "pcsx2/ImGui/ImGuiOverlays.h"
 #include "pcsx2/Input/InputManager.h"
 #include "pcsx2/MTGS.h"
+#include "pcsx2/Oracle.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/SPU2/spu2.h"
 #include "pcsx2/VMManager.h"
@@ -1363,6 +1364,14 @@ bool QtHost::InitializeConfig()
 	Host::Internal::SetBaseSettingsLayer(s_base_settings_interface.get());
 	if (!settings_exists || !s_base_settings_interface->Load() || !VMManager::Internal::CheckSettingsVersion())
 	{
+		// Oracle mode must not block on the reset prompt below.
+		if (Oracle::IsEnabled() && FileSystem::FileExists(s_base_settings_interface->GetFileName().c_str()))
+		{
+			std::fprintf(stderr, "Oracle: FAIL: settings failed to load, or are the incorrect version: %s\n",
+				s_base_settings_interface->GetFileName().c_str());
+			return false;
+		}
+
 		// If the config file doesn't exist, assume this is a new install and don't prompt to overwrite.
 		if (FileSystem::FileExists(s_base_settings_interface->GetFileName().c_str()) &&
 			QMessageBox::question(nullptr, QStringLiteral("PCSX2"),
@@ -1696,6 +1705,13 @@ void Host::ReportErrorAsync(const std::string_view title, const std::string_view
 		ERROR_LOG("ReportErrorAsync: {}: {}", title, message);
 	else if (!message.empty())
 		ERROR_LOG("ReportErrorAsync: {}", message);
+
+	// Message boxes block invisibly in headless runs, so oracle mode turns every error into a failed run.
+	if (Oracle::IsEnabled())
+	{
+		Oracle::Fail(title.empty() ? std::string(message) : fmt::format("{}: {}", title, message));
+		return;
+	}
 
 	QMetaObject::invokeMethod(g_main_window, "reportError", Qt::QueuedConnection,
 		Q_ARG(const QString&, title.empty() ? QString() : QString::fromUtf8(title.data(), title.size())),
@@ -2139,6 +2155,7 @@ void QtHost::PrintCommandLineHelp(const std::string_view progname)
 	std::fprintf(stderr, "  -gameargs <string>: passes the specified quoted space-delimited string of launch arguments.\n");
 	std::fprintf(stderr, "  -disc <path>: Uses the specified host DVD drive as a source.\n");
 	std::fprintf(stderr, "  -logfile <path>: Writes the application log to path instead of emulog.txt.\n");
+	std::fprintf(stderr, "  -oracle <file>: Runs in oracle mode (deterministic headless run) with the given spec file. Requires -batch or -nogui and a boot file.\n");
 	std::fprintf(stderr, "  -bios: Starts the BIOS (System Menu/OSDSYS).\n");
 	std::fprintf(stderr, "  -fastboot: Force fast boot for provided filename.\n");
 	std::fprintf(stderr, "  -slowboot: Force slow boot for provided filename.\n");
@@ -2260,6 +2277,17 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 				VMManager::Internal::SetFileLogPath((++it)->toStdString());
 				continue;
 			}
+			else if (CHECK_ARG_PARAM(QStringLiteral("-oracle")))
+			{
+				Oracle::SetSpecPath((++it)->toStdString());
+				continue;
+			}
+			else if (CHECK_ARG(QStringLiteral("-oracle")))
+			{
+				// Without this, the generic unknown-parameter handler below would show a message box.
+				std::fprintf(stderr, "Oracle: -oracle requires a spec file argument.\n");
+				return false;
+			}
 			else if (CHECK_ARG(QStringLiteral("-bios")))
 			{
 				AutoBoot(autoboot)->source_type = CDVD_SourceType::NoDisc;
@@ -2356,6 +2384,26 @@ bool QtHost::ParseCommandLineOptions(const QStringList& args, std::shared_ptr<VM
 	{
 		Console.Warning("Both turbo and unlimited frame limit modes requested. Using unlimited.");
 		autoboot->start_turbo.reset();
+	}
+
+	// Oracle mode must never reach a message box, so refuse bad combinations here, on stderr.
+	if (Oracle::IsEnabled())
+	{
+		const char* problem = nullptr;
+		if (!s_batch_mode)
+			problem = "-oracle requires -batch or -nogui.";
+		else if (!autoboot || (autoboot->filename.empty() && autoboot->elf_override.empty()))
+			problem = "-oracle requires a boot file (disc or ELF).";
+		else if (autoboot->state_index.has_value() || !autoboot->save_state.empty())
+			problem = "-oracle does not allow -state or -statefile.";
+		else if (autoboot->fast_boot.has_value() && !autoboot->fast_boot.value())
+			problem = "-oracle does not allow -slowboot.";
+
+		if (problem)
+		{
+			std::fprintf(stderr, "Oracle: FAIL: %s\n", problem);
+			return false;
+		}
 	}
 
 	// if we don't have autoboot, we definitely don't want batch mode (because that'll skip
@@ -2567,6 +2615,12 @@ shutdown_and_exit:
 	// Ensure config is written. Prevents destruction order issues.
 	if (s_base_settings_interface->IsDirty())
 		s_base_settings_interface->Save();
+
+	if (Oracle::IsEnabled())
+	{
+		Oracle::OnProcessExit();
+		return Oracle::GetExitCode();
+	}
 
 	return result;
 }

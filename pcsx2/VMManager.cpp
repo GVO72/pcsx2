@@ -24,6 +24,7 @@
 #include "IopBios.h"
 #include "MTGS.h"
 #include "MTVU.h"
+#include "Oracle.h"
 #include "PINE.h"
 #include "Patch.h"
 #include "PerformanceMetrics.h"
@@ -1606,6 +1607,9 @@ VMBootResult VMManager::Initialize(const VMBootParameters& boot_params, Error* e
 	}
 	ScopedGuard close_fw = []() { FWclose(); };
 
+	if (Oracle::IsEnabled() && !Oracle::OnVMInitialized(error))
+		return VMBootResult::StartupFailure;
+
 	// Don't close when we return
 	close_fw.Cancel();
 	close_usb.Cancel();
@@ -1660,6 +1664,9 @@ void VMManager::Shutdown(bool save_resume_state)
 	if (THREAD_VU1)
 		vu1Thread.WaitVU();
 	MTGS::WaitGS();
+
+	if (Oracle::IsEnabled())
+		Oracle::OnVMShutdown();
 
 	if (!GSDumpReplayer::IsReplayingDump() && save_resume_state)
 	{
