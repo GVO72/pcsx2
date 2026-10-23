@@ -7,9 +7,16 @@
 #include "DebugTools/Debug.h"
 #include "Counters.h"
 #include "Host.h"
+#include "IopMem.h"
 #include "ImGui/FullscreenUI.h"
 #include "INISettingsInterface.h"
+#include "Memory.h"
+#include "MemoryTypes.h"
+#include "R3000A.h"
+#include "R5900.h"
 #include "VMManager.h"
+#include "VU.h"
+#include "VUmicro.h"
 
 #include "common/Console.h"
 #include "common/FileSystem.h"
@@ -21,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <vector>
@@ -354,6 +362,11 @@ namespace Oracle
 		if (!CheckSettings(&settings_error))
 			return SetFailure(error, fmt::format("settings: {}", settings_error.GetDescription()));
 
+		const std::string state_dir = Path::Combine(s_spec.output_dir, "state");
+		Error dir_error;
+		if (!FileSystem::EnsureDirectoryExists(state_dir.c_str(), false, &dir_error))
+			return SetFailure(error, fmt::format("cannot create '{}': {}", state_dir, dir_error.GetDescription()));
+
 		{
 			std::lock_guard lock(s_console_mutex);
 			s_console_capture = true;
@@ -394,6 +407,145 @@ namespace Oracle
 		config.LoadSave(wrapper);
 		if (!si.Save())
 			Fail(fmt::format("could not write '{}'", path));
+	}
+
+	// ---- State dump -----------------------------------------------------------------------
+	//
+	// state/<frame>.bin, little endian, version 1:
+	//   header (40 bytes): char magic[8] = "PS2PSTAT"; u32 version = 1; u32 section_count; u32 frame;
+	//                      u32 flags = 0; u64 ee_cycle (cpuRegs.cycle); u64 iop_cycle (psxRegs.cycle)
+	//   section table, section_count entries of { char tag[16] (NUL padded); u64 offset; u64 size },
+	//   offsets from the start of the file;
+	//   section data, each section starting at a 16-byte aligned offset, zero padded in between.
+	// Section contents are the raw bytes of PCSX2's structures, in this order:
+	//   EE.GPR     cpuRegs.GPR, 32 x 128 bit
+	//   EE.HI      cpuRegs.HI, 128 bit        EE.LO  cpuRegs.LO, 128 bit
+	//   EE.SA      cpuRegs.sa, u32            EE.PC  cpuRegs.pc, u32
+	//   EE.COP0    cpuRegs.CP0, 32 x u32
+	//   EE.PERF    cpuRegs.PERF (PERFregs, 16 bytes)
+	//   EE.TLB     tlb[48] (tlbs: PageMask, EntryHi, EntryLo0, EntryLo1 as u32 each), as stored
+	//   FPU.FPR    fpuRegs.fpr, 32 x u32      FPU.FCR  fpuRegs.fprc, 32 x u32
+	//   FPU.ACC    fpuRegs.ACC (u32) then fpuRegs.ACCflag (u32)
+	//   VU0.VF     VU0.VF, 32 x 128 bit       VU0.VI  low u32 of each VU0.VI entry, 32 x u32
+	//   VU0.ACC    VU0.ACC, 128 bit
+	//   VU0.QP     VU0.q then VU0.p, each a REG_VI as stored (16 bytes: u32 value + 12 bytes padding)
+	//   VU0.MEM    VU0 data memory, 4 KB      VU0.MICRO  VU0 micro memory, 4 KB
+	//   EE.RAM     first 32 MB of main memory (eeMem->Main)
+	//   EE.SPR     scratchpad, 16 KB
+	//   IOP.GPR    psxRegs.GPR.r, 34 x u32 (r[0..31], then r[32] = hi, r[33] = lo)
+	//   IOP.COP0   psxRegs.CP0.r, 32 x u32
+	//   IOP.PC     psxRegs.pc, u32
+	//   IOP.RAM    first 2 MB of IOP main memory (iopMem->Main)
+	static_assert(sizeof(GPR_reg) == 16 && sizeof(cpuRegs.GPR) == 32 * 16);
+	static_assert(sizeof(cpuRegs.CP0) == 32 * 4 && sizeof(cpuRegs.PERF) == 16);
+	static_assert(sizeof(tlbs) == 16 && sizeof(tlb) == 48 * 16);
+	static_assert(sizeof(fpuRegs.fpr) == 32 * 4 && sizeof(fpuRegs.fprc) == 32 * 4);
+	static_assert(sizeof(VECTOR) == 16 && sizeof(REG_VI) == 16 && sizeof(VU0.VF) == 32 * 16);
+	static_assert(sizeof(psxRegs.GPR) == 34 * 4 && sizeof(psxRegs.CP0) == 32 * 4);
+	static_assert(Ps2MemSize::MainRam == 32 * 1024 * 1024 && Ps2MemSize::IopRam == 2 * 1024 * 1024);
+	static_assert(Ps2MemSize::Scratch == 16 * 1024 && VU0_MEMSIZE == 4096 && VU0_PROGSIZE == 4096);
+
+	namespace
+	{
+		struct StateSection
+		{
+			char tag[16];
+			const void* data;
+			u64 size;
+		};
+	} // namespace
+
+	static void PutU32(std::string& out, u32 v)
+	{
+		out.append(reinterpret_cast<const char*>(&v), sizeof(v));
+	}
+
+	static void PutU64(std::string& out, u64 v)
+	{
+		out.append(reinterpret_cast<const char*>(&v), sizeof(v));
+	}
+
+	static void WriteStateDump(int frame)
+	{
+		// Registers are in memory here: this runs inside cpuEventTest, which both recompilers only
+		// reach at a block boundary, after the block has written its registers back.
+		u32 vu0_vi[32];
+		for (int i = 0; i < 32; i++)
+			vu0_vi[i] = VU0.VI[i].UL;
+		const u32 fpu_acc[2] = {fpuRegs.ACC.UL, fpuRegs.ACCflag};
+		const u32 iop_pc = psxRegs.pc;
+
+		const auto tagged = [](const char* tag, const void* data, u64 size) {
+			StateSection section{};
+			std::strncpy(section.tag, tag, sizeof(section.tag) - 1);
+			section.data = data;
+			section.size = size;
+			return section;
+		};
+		const StateSection sections[] = {
+			tagged("EE.GPR", &cpuRegs.GPR, sizeof(cpuRegs.GPR)),
+			tagged("EE.HI", &cpuRegs.HI, sizeof(cpuRegs.HI)),
+			tagged("EE.LO", &cpuRegs.LO, sizeof(cpuRegs.LO)),
+			tagged("EE.SA", &cpuRegs.sa, sizeof(cpuRegs.sa)),
+			tagged("EE.PC", &cpuRegs.pc, sizeof(cpuRegs.pc)),
+			tagged("EE.COP0", &cpuRegs.CP0, sizeof(cpuRegs.CP0)),
+			tagged("EE.PERF", &cpuRegs.PERF, sizeof(cpuRegs.PERF)),
+			tagged("EE.TLB", tlb, sizeof(tlb)),
+			tagged("FPU.FPR", fpuRegs.fpr, sizeof(fpuRegs.fpr)),
+			tagged("FPU.FCR", fpuRegs.fprc, sizeof(fpuRegs.fprc)),
+			tagged("FPU.ACC", fpu_acc, sizeof(fpu_acc)),
+			tagged("VU0.VF", VU0.VF, sizeof(VU0.VF)),
+			tagged("VU0.VI", vu0_vi, sizeof(vu0_vi)),
+			tagged("VU0.ACC", &VU0.ACC, sizeof(VU0.ACC)),
+			tagged("VU0.QP", &VU0.q, 2 * sizeof(REG_VI)), // q and p are adjacent members
+			tagged("VU0.MEM", VU0.Mem, VU0_MEMSIZE),
+			tagged("VU0.MICRO", VU0.Micro, VU0_PROGSIZE),
+			tagged("EE.RAM", eeMem->Main, Ps2MemSize::MainRam),
+			tagged("EE.SPR", eeMem->Scratch, Ps2MemSize::Scratch),
+			tagged("IOP.GPR", &psxRegs.GPR, sizeof(psxRegs.GPR)),
+			tagged("IOP.COP0", &psxRegs.CP0, sizeof(psxRegs.CP0)),
+			tagged("IOP.PC", &iop_pc, sizeof(iop_pc)),
+			tagged("IOP.RAM", iopMem->Main, Ps2MemSize::IopRam),
+		};
+		static_assert(offsetof(VURegs, p) == offsetof(VURegs, q) + sizeof(REG_VI));
+		constexpr u64 section_count = std::size(sections);
+		constexpr u64 header_size = 40;
+		constexpr u64 entry_size = 32;
+
+		std::string out;
+		out.append("PS2PSTAT", 8);
+		PutU32(out, 1);
+		PutU32(out, static_cast<u32>(section_count));
+		PutU32(out, static_cast<u32>(frame));
+		PutU32(out, 0);
+		PutU64(out, cpuRegs.cycle);
+		PutU64(out, psxRegs.cycle);
+
+		u64 offset = header_size + section_count * entry_size;
+		for (const StateSection& section : sections)
+		{
+			offset = (offset + 15) & ~u64(15);
+			out.append(section.tag, sizeof(section.tag));
+			PutU64(out, offset);
+			PutU64(out, section.size);
+			offset += section.size;
+		}
+		for (const StateSection& section : sections)
+		{
+			out.resize((out.size() + 15) & ~size_t(15), '\0');
+			out.append(static_cast<const char*>(section.data), section.size);
+		}
+
+		const std::string path = Path::Combine(Path::Combine(s_spec.output_dir, "state"), fmt::format("{}.bin", frame));
+		const std::string tmp_path = path + ".tmp";
+		Error error;
+		if (!FileSystem::WriteStringToFile(tmp_path.c_str(), out) ||
+			!FileSystem::RenamePath(tmp_path.c_str(), path.c_str(), &error))
+		{
+			Fail(fmt::format("could not write state dump '{}'", path));
+			return;
+		}
+		Console.WriteLn("Oracle: wrote %s", path.c_str());
 	}
 
 	void OnEntryPoint(const std::string& elf_path, u32 entry_point)
@@ -442,7 +594,10 @@ namespace Oracle
 		}
 
 		if (std::binary_search(s_spec.checkpoints.begin(), s_spec.checkpoints.end(), frame))
+		{
 			Console.WriteLn("Oracle: checkpoint frame %d", frame);
+			WriteStateDump(frame);
+		}
 
 		if (frame == s_spec.end_frame)
 		{
