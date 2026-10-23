@@ -5,6 +5,7 @@
 
 #include "Config.h"
 #include "DebugTools/Debug.h"
+#include "Counters.h"
 #include "Host.h"
 #include "ImGui/FullscreenUI.h"
 #include "INISettingsInterface.h"
@@ -13,6 +14,7 @@
 #include "common/Console.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
+#include "common/SettingsWrapper.h"
 #include "common/StringUtil.h"
 
 #include "fmt/format.h"
@@ -55,8 +57,13 @@ namespace Oracle
 	static std::atomic_bool s_failed{false};
 	static bool s_status_written = false; // guarded by s_mutex
 
-	// Set by the code that reaches the final frame. Always false until frame counting exists.
-	static bool s_end_frame_reached = false;
+	// Frame counting, all on the CPU thread. Frame 0 is the first vsync after the boot ELF's entry
+	// point; before that, vsyncs only count against MaxBootVsyncs.
+	static bool s_anchored = false;
+	static int s_boot_vsyncs = 0;
+	static int s_next_frame = 0;
+	static std::string s_elf_log; // elf.tsv: frame, entry point, path
+	static std::atomic_bool s_end_frame_reached{false};
 
 	// Records the failure without requesting a shutdown. Keeps the first reason only.
 	static void RecordFailure(std::string_view reason)
@@ -332,6 +339,97 @@ namespace Oracle
 		return true;
 	}
 
+	// Basename of an ELF path such as "cdrom0:\\HELLO.ELF;1" or "host:/dir/HELLO.ELF": the part after
+	// the last separator, without an ISO9660 ";1" version suffix.
+	static std::string_view ElfBasename(std::string_view path)
+	{
+		const size_t sep = path.find_last_of("\\/:");
+		if (sep != std::string_view::npos)
+			path.remove_prefix(sep + 1);
+		const size_t version = path.find(';');
+		if (version != std::string_view::npos)
+			path = path.substr(0, version);
+		return path;
+	}
+
+	static void WriteFile(const char* name, std::string_view contents)
+	{
+		const std::string path = Path::Combine(s_spec.output_dir, name);
+		if (!FileSystem::WriteStringToFile(path.c_str(), contents))
+			Fail(fmt::format("could not write '{}'", path));
+	}
+
+	// The effective configuration once the game database has applied its settings, in PCSX2.ini form.
+	static void WriteEffectiveConfig()
+	{
+		const std::string path = Path::Combine(s_spec.output_dir, "effective-config.ini");
+		INISettingsInterface si(path);
+		Pcsx2Config config = EmuConfig;
+		SettingsSaveWrapper wrapper(si);
+		config.LoadSave(wrapper);
+		if (!si.Save())
+			Fail(fmt::format("could not write '{}'", path));
+	}
+
+	void OnEntryPoint(const std::string& elf_path, u32 entry_point)
+	{
+		if (s_failed.load(std::memory_order_acquire))
+			return;
+
+		s_elf_log += fmt::format("{}\t0x{:08X}\t{}\n", s_next_frame, entry_point, elf_path);
+		if (s_anchored)
+		{
+			Console.WriteLn("Oracle: ELF %s started before frame %d", elf_path.c_str(), s_next_frame);
+			return;
+		}
+
+		s_anchored = true;
+		Console.WriteLn("Oracle: anchor: ELF %s, entry point 0x%08X, after %d boot vsyncs; frame 0 is the next vsync",
+			elf_path.c_str(), entry_point, s_boot_vsyncs);
+		if (!s_spec.expect_elf.empty() && !StringUtil::compareNoCase(ElfBasename(elf_path), s_spec.expect_elf))
+			Fail(fmt::format("boot ELF is '{}', expected '{}'", elf_path, s_spec.expect_elf));
+	}
+
+	void OnVSyncCPU()
+	{
+		if (s_failed.load(std::memory_order_acquire) || s_end_frame_reached.load(std::memory_order_relaxed))
+			return;
+
+		if (!s_anchored)
+		{
+			if (++s_boot_vsyncs > s_spec.max_boot_vsyncs)
+				Fail(fmt::format("the boot ELF's entry point was not reached within {} vsyncs", s_spec.max_boot_vsyncs));
+			return;
+		}
+
+		const int frame = s_next_frame++;
+		if (frame == 0)
+		{
+			// The game database has applied its settings by now (at the entry point), so check again.
+			Error settings_error;
+			if (!CheckSettings(&settings_error))
+			{
+				Fail(fmt::format("settings at frame 0: {}", settings_error.GetDescription()));
+				return;
+			}
+			WriteEffectiveConfig();
+			Console.WriteLn("Oracle: frame 0 (VM vsync count %u)", g_FrameCount);
+		}
+
+		if (std::binary_search(s_spec.checkpoints.begin(), s_spec.checkpoints.end(), frame))
+			Console.WriteLn("Oracle: checkpoint frame %d", frame);
+
+		if (frame == s_spec.end_frame)
+		{
+			// Requesting the shutdown from the CPU thread only sets a flag: the rest of this vsync
+			// still runs, so this frame reaches the GS thread before execution stops.
+			s_end_frame_reached.store(true, std::memory_order_release);
+			WriteFile("elf.tsv", s_elf_log);
+			Console.WriteLn("Oracle: EndFrame %d reached, shutting down", frame);
+			Host::RequestVMShutdown(false, false, false);
+		}
+	}
+
 	void Fail(std::string_view reason)
 	{
 		Console.Error("Oracle: FAIL: %.*s", static_cast<int>(reason.size()), reason.data());
@@ -384,7 +482,7 @@ namespace Oracle
 	// Writes status.json once. Must be the last thing the oracle writes.
 	static void WriteStatus()
 	{
-		if (!s_end_frame_reached)
+		if (!s_end_frame_reached.load(std::memory_order_acquire))
 			RecordFailure("VM stopped before EndFrame was reached");
 
 		std::lock_guard lock(s_mutex);

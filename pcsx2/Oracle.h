@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/Error.h"
+#include "common/Pcsx2Types.h"
 
 #include <string>
 #include <string_view>
@@ -30,6 +31,14 @@ namespace Oracle
 	/// (e.g. once the game database has applied its settings). Sets the error and returns false on
 	/// the first mismatch. Does not record the failure itself.
 	bool CheckSettings(Error* error);
+
+	/// Called on the CPU thread when an ELF's entry point is about to execute. The first call is
+	/// the anchor: frame 0 is the next vsync. Later calls (ELF changes) are logged with their frame.
+	void OnEntryPoint(const std::string& elf_path, u32 entry_point);
+
+	/// Called on the CPU thread at every EE vsync, before the frame is handed to the GS thread.
+	/// Counts boot vsyncs until the anchor, then oracle frames, and stops the VM after EndFrame.
+	void OnVSyncCPU();
 
 	/// Records a failure and requests that the VM (and the application) shut down. Thread-safe.
 	/// Only the first reason is kept.

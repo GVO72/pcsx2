@@ -2904,6 +2904,9 @@ void VMManager::Internal::EntryPointCompilingOnCPUThread()
 	ClearCPUExecutionCaches();
 
 	R5900SymbolImporter.OnElfLoadedInMemory();
+
+	if (Oracle::IsEnabled())
+		Oracle::OnEntryPoint(s_elf_path, s_elf_entry_point);
 }
 
 void VMManager::Internal::VSyncOnCPUThread()
@@ -2927,6 +2930,9 @@ void VMManager::Internal::VSyncOnCPUThread()
 	Achievements::FrameUpdate();
 
 	PollDiscordPresence();
+
+	if (Oracle::IsEnabled())
+		Oracle::OnVSyncCPU();
 }
 
 void VMManager::Internal::PollInputOnCPUThread()
