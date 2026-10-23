@@ -11,6 +11,7 @@
 #include "ImGui/FullscreenUI.h"
 #include "INISettingsInterface.h"
 #include "GS/GS.h"
+#include "GS/GSCapture.h"
 #include "GS/Renderers/Common/GSDevice.h"
 #include "GS/Renderers/Common/GSRenderer.h"
 #include "GS/Renderers/Common/GSTexture.h"
@@ -54,6 +55,7 @@ namespace Oracle
 			int canvas_width = 0;
 			int canvas_height = 0;
 			int max_boot_vsyncs = 0;
+			float record_fps = 0.0f; // 0: the GS refresh rate at frame 0
 			std::string expect_elf;
 		};
 	} // namespace
@@ -87,6 +89,8 @@ namespace Oracle
 	static std::string s_frames_tsv; // frames.tsv: frame, width, height, MD5 of the canonical image or "blank"
 	static std::string s_video_mode = "unknown"; // GS video mode at EndFrame
 	static std::unique_ptr<GSDownloadTexture> s_download;
+	static bool s_recording = false; // oracle mode owns the video capture
+	static GSTexture* s_canvas = nullptr; // fixed-size frame handed to the capture
 
 	// Guest console capture. Written to ee-console.txt, iop-console.txt and console.tsv at shutdown.
 	// Guarded by s_console_mutex: the writers run on the CPU thread, but this does not rely on it.
@@ -237,7 +241,7 @@ namespace Oracle
 		}
 
 		static constexpr const char* const known_keys[] = {"Version", "OutputDir", "EndFrame", "Checkpoints", "Record",
-			"CanvasWidth", "CanvasHeight", "MaxBootVsyncs", "ExpectElf"};
+			"CanvasWidth", "CanvasHeight", "MaxBootVsyncs", "ExpectElf", "RecordFps"};
 		std::set<std::string> seen;
 		for (const auto& [key, value] : si.GetKeyValueList(SECTION))
 		{
@@ -321,6 +325,13 @@ namespace Oracle
 			return false;
 		}
 
+		if (si.ContainsValue(SECTION, "RecordFps") &&
+			(!si.GetFloatValue(SECTION, "RecordFps", &spec->record_fps) || !(spec->record_fps > 0.0f)))
+		{
+			*err = "spec: key 'RecordFps' must be a number > 0";
+			return false;
+		}
+
 		if (si.ContainsValue(SECTION, "ExpectElf"))
 			si.GetStringValue(SECTION, "ExpectElf", &spec->expect_elf);
 
@@ -354,6 +365,30 @@ namespace Oracle
 			{"Logging/EnableIOPConsole", "true", ConsoleLogging.iopConsole.IsActive()},
 			{"SPU2/Output/Backend", "Null", EmuConfig.SPU2.Backend == AudioBackend::Null},
 		};
+
+		// Recording must be lossless: FFV1 with a 24-bit RGB pixel format, and float PCM, which is
+		// exactly what the sound processor produces.
+		const Pcsx2Config::GSOptions& gs = EmuConfig.GS;
+		const Check record_checks[] = {
+			{"EmuCore/GS/EnableVideoCapture", "true", gs.EnableVideoCapture},
+			{"EmuCore/GS/EnableAudioCapture", "true", gs.EnableAudioCapture},
+			{"EmuCore/GS/VideoCaptureCodec", "ffv1", gs.VideoCaptureCodec == "ffv1"},
+			{"EmuCore/GS/EnableVideoCaptureParameters", "true", gs.EnableVideoCaptureParameters},
+			{"EmuCore/GS/VideoCaptureParameters", "pixel_format=bgr0", gs.VideoCaptureParameters == "pixel_format=bgr0"},
+			{"EmuCore/GS/AudioCaptureCodec", "pcm_f32le", gs.AudioCaptureCodec == "pcm_f32le"},
+			{"EmuCore/GS/EnableAudioCaptureParameters", "false", !gs.EnableAudioCaptureParameters},
+		};
+		if (s_spec.record)
+		{
+			for (const Check& check : record_checks)
+			{
+				if (!check.ok)
+				{
+					Error::SetString(error, fmt::format("setting {} must be {} when recording", check.name, check.expected));
+					return false;
+				}
+			}
+		}
 
 		for (const Check& check : checks)
 		{
@@ -579,6 +614,8 @@ namespace Oracle
 			Fail(fmt::format("boot ELF is '{}', expected '{}'", elf_path, s_spec.expect_elf));
 	}
 
+	static void StartRecording();
+
 	void OnVSyncCPU()
 	{
 		if (s_failed.load(std::memory_order_acquire) || s_end_frame_reached.load(std::memory_order_relaxed))
@@ -610,6 +647,8 @@ namespace Oracle
 			MTGS::RunOnGSThread([]() {
 				s_gs_frame = 0;
 				s_gs_started = true;
+				if (s_spec.record)
+					StartRecording();
 			});
 			MTGS::WaitGS(false, false, false);
 		}
@@ -725,9 +764,84 @@ namespace Oracle
 			Fail(fmt::format("could not write GS dump '{}'", path));
 	}
 
+	// GS thread. Video frames go in at the canvas size, so nothing is ever scaled; audio capture starts
+	// at the same moment, because the CPU thread is waiting for this message.
+	static void StartRecording()
+	{
+		const GSVector2i size(s_spec.canvas_width, s_spec.canvas_height);
+		s_canvas = g_gs_device->CreateRenderTarget(size.x, size.y, GSTexture::Format::Color, true, false);
+		const std::string path = Path::Combine(s_spec.output_dir, "recording.mkv");
+		// The GS may still be in the BIOS's video mode at frame 0, so the harness passes the disc's frame
+		// rate. Pixels are square: the canvas is shown 1:1, padding included.
+		const float fps = (s_spec.record_fps > 0.0f) ? s_spec.record_fps : g_gs_renderer->GetTvRefreshRate();
+		const float aspect = static_cast<float>(size.x) / static_cast<float>(size.y);
+		if (!s_canvas || !GSCapture::BeginCapture(fps, size, aspect, path) || !GSCapture::IsCapturingVideo() ||
+			GSCapture::GetSize() != size)
+		{
+			Fail(fmt::format("could not start the recording '{}'", path));
+			return;
+		}
+		s_recording = true;
+		Console.WriteLn("Oracle: recording to %s at %dx%d, %.3f fps", path.c_str(), size.x, size.y, fps);
+	}
+
+	// GS thread. Ends the capture (the file is finalised) and releases the canvas.
+	static void StopRecording()
+	{
+		if (s_recording)
+		{
+			s_recording = false;
+			GSCapture::EndCapture();
+		}
+		if (s_canvas)
+		{
+			g_gs_device->Recycle(s_canvas);
+			s_canvas = nullptr;
+		}
+	}
+
+	// GS thread. The frame's image goes 1:1 into the top-left corner of the black canvas.
+	static void DeliverRecordingFrame(int frame, GSTexture* current, bool blank)
+	{
+		if (!GSCapture::IsCapturingVideo())
+		{
+			s_recording = false;
+			Fail(fmt::format("the recording stopped before frame {}", frame));
+			return;
+		}
+
+		g_gs_device->ClearRenderTarget(s_canvas, 0);
+		if (!blank)
+		{
+			if (current->GetWidth() > s_canvas->GetWidth() || current->GetHeight() > s_canvas->GetHeight())
+			{
+				Fail(fmt::format("frame {} is {}x{}, larger than the {}x{} recording canvas", frame, current->GetWidth(),
+					current->GetHeight(), s_canvas->GetWidth(), s_canvas->GetHeight()));
+				return;
+			}
+			g_gs_device->CopyRect(current, s_canvas, GSVector4i(0, 0, current->GetWidth(), current->GetHeight()), 0, 0);
+		}
+		if (!GSCapture::DeliverVideoFrame(s_canvas))
+			Fail(fmt::format("the recording failed at frame {}", frame));
+	}
+
+	bool OwnsVideoCapture()
+	{
+		return s_recording;
+	}
+
+	void OnGSReopenOrReset(const char* what)
+	{
+		if (s_gs_started)
+			Fail(fmt::format("the GS was {} at frame {}; the recording would restart", what, s_gs_frame));
+		StopRecording();
+		s_download.reset();
+	}
+
 	void OnGSVSync(GSRenderer& renderer, bool blank_frame)
 	{
-		if (!s_gs_started || s_gs_frame > s_spec.end_frame)
+		// After a failure the run is over: stop recording frames and writing files.
+		if (!s_gs_started || s_gs_frame > s_spec.end_frame || s_failed.load(std::memory_order_acquire))
 			return;
 
 		// One vsync message per EE vsync, so this counter matches the CPU thread's frame numbers.
@@ -749,6 +863,9 @@ namespace Oracle
 		}
 		s_frames_tsv += fmt::format("{}\t{}\t{}\t{}\n", frame, width, height, blank ? "blank" : CanonicalImageMD5(pixels));
 
+		if (s_recording)
+			DeliverRecordingFrame(frame, current, blank);
+
 		if (std::binary_search(s_spec.checkpoints.begin(), s_spec.checkpoints.end(), frame))
 		{
 			if (!blank)
@@ -759,6 +876,7 @@ namespace Oracle
 		if (frame == s_spec.end_frame)
 		{
 			s_video_mode = VideoModeName(renderer.GetVideoMode());
+			StopRecording(); // frames 0..EndFrame are in the file
 			s_download.reset(); // GPU objects must go before the GS device does
 		}
 	}
@@ -994,6 +1112,7 @@ namespace Oracle
 		// EndFrame they are still held).
 		MTGS::RunOnGSThread([]() {
 			s_gs_started = false;
+			StopRecording();
 			s_download.reset();
 		});
 		MTGS::WaitGS(false, false, false);

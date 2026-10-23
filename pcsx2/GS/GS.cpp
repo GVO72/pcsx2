@@ -20,6 +20,7 @@
 #include "GS/Renderers/Null/GSRendererNull.h"
 #include "GS/Renderers/HW/GSRendererHW.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
+#include "Oracle.h"
 #include "VMManager.h"
 
 #ifdef ENABLE_OPENGL
@@ -243,6 +244,8 @@ bool GSreopen(bool recreate_device, bool recreate_renderer, GSRendererType new_r
 	std::optional<const Pcsx2Config::GSOptions*> old_config)
 {
 	Console.WriteLn("Reopening GS with %s device", recreate_device ? "new" : "existing");
+	if (Oracle::IsEnabled())
+		Oracle::OnGSReopenOrReset("reopened");
 
 	g_gs_renderer->Flush(GSState::GSFlushReason::GSREOPEN);
 
@@ -381,6 +384,8 @@ void GSclose()
 void GSreset(bool hardware_reset)
 {
 	g_gs_renderer->Reset(hardware_reset);
+	if (Oracle::IsEnabled() && hardware_reset)
+		Oracle::OnGSReopenOrReset("hardware-reset");
 
 	// Restart video capture if it's been started.
 	// Otherwise we get a buildup of audio frames from the CPU thread.

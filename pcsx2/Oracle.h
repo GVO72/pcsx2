@@ -47,6 +47,14 @@ namespace Oracle
 	/// writes the image as PNG plus the GS memory and registers.
 	void OnGSVSync(GSRenderer& renderer, bool blank_frame);
 
+	/// True while oracle mode feeds the video capture itself (GS thread), so the stock delivery skips it.
+	bool OwnsVideoCapture();
+
+	/// Called on the GS thread when the GS is about to be reopened or hardware-reset. Ends the oracle's
+	/// recording and releases its GPU objects; after frame 0 this fails the run, because the recording
+	/// would otherwise restart in a new file.
+	void OnGSReopenOrReset(const char* what);
+
 	/// Called for every piece of text the guest writes to its EE or IOP console (prefix "EEout",
 	/// "DECI2" or "IOPout"), after PCSX2's character set conversion. Safe to call from any thread.
 	void OnVMConsole(std::string_view prefix, std::string_view text);

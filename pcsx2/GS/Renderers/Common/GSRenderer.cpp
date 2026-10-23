@@ -810,8 +810,8 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		}
 	}
 
-	// capture
-	if (GSCapture::IsCapturingVideo())
+	// capture (oracle mode delivers its own frames)
+	if (GSCapture::IsCapturingVideo() && !Oracle::OwnsVideoCapture())
 	{
 		const GSVector2i size = GSCapture::GetSize();
 		if (GSTexture* current = g_gs_device->GetCurrent())
