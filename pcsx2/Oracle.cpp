@@ -65,6 +65,26 @@ namespace Oracle
 	static std::string s_elf_log; // elf.tsv: frame, entry point, path
 	static std::atomic_bool s_end_frame_reached{false};
 
+	// Guest console capture. Written to ee-console.txt, iop-console.txt and console.tsv at shutdown.
+	// Guarded by s_console_mutex: the writers run on the CPU thread, but this does not rely on it.
+	namespace
+	{
+		struct ConsoleSource
+		{
+			const char* name; // console.tsv source column
+			std::string text; // the whole console output
+			std::string line; // current incomplete line
+		};
+	} // namespace
+
+	static std::mutex s_console_mutex;
+	static bool s_console_capture = false;
+	static bool s_console_written = false;
+	static ConsoleSource s_console_ee{"ee"};
+	static ConsoleSource s_console_iop{"iop"};
+	static std::string s_console_tsv;
+	static bool s_console_unknown_warned = false;
+
 	// Records the failure without requesting a shutdown. Keeps the first reason only.
 	static void RecordFailure(std::string_view reason)
 	{
@@ -334,6 +354,11 @@ namespace Oracle
 		if (!CheckSettings(&settings_error))
 			return SetFailure(error, fmt::format("settings: {}", settings_error.GetDescription()));
 
+		{
+			std::lock_guard lock(s_console_mutex);
+			s_console_capture = true;
+		}
+
 		Console.WriteLn("Oracle: spec OK (EndFrame %d, %zu checkpoints, OutputDir '%s')", s_spec.end_frame,
 			s_spec.checkpoints.size(), s_spec.output_dir.c_str());
 		return true;
@@ -430,6 +455,108 @@ namespace Oracle
 		}
 	}
 
+	// Escapes tab, CR, backslash and other control characters so that a console.tsv row stays one line.
+	static std::string EscapeConsoleLine(std::string_view line)
+	{
+		std::string out;
+		out.reserve(line.size());
+		for (const char c : line)
+		{
+			const unsigned char u = static_cast<unsigned char>(c);
+			if (c == '\t')
+				out += "\\t";
+			else if (c == '\r')
+				out += "\\r";
+			else if (c == '\\')
+				out += "\\\\";
+			else if (u < 0x20 || u == 0x7F)
+				out += fmt::format("\\x{:02X}", u);
+			else
+				out += c;
+		}
+		return out;
+	}
+
+	// The frame column is -1 until the anchor, then the frame of the next vsync to be counted
+	// (s_next_frame), the same numbering elf.tsv uses. Both are only written on the CPU thread.
+	static void AppendConsoleRow(const ConsoleSource& src)
+	{
+		const int frame = s_anchored ? s_next_frame : -1;
+		s_console_tsv += fmt::format("{}\t{}\t{}\n", frame, src.name, EscapeConsoleLine(src.line));
+	}
+
+	void OnVMConsole(std::string_view prefix, std::string_view text)
+	{
+		std::lock_guard lock(s_console_mutex);
+		if (!s_console_capture)
+			return;
+
+		ConsoleSource* src;
+		if (prefix == "EEout" || prefix == "DECI2")
+			src = &s_console_ee;
+		else if (prefix == "IOPout")
+			src = &s_console_iop;
+		else
+		{
+			if (!s_console_unknown_warned)
+			{
+				s_console_unknown_warned = true;
+				Console.Warning("Oracle: ignoring console output with unknown prefix '%.*s'", static_cast<int>(prefix.size()),
+					prefix.data());
+			}
+			return;
+		}
+
+		src->text.append(text);
+		for (const char c : text)
+		{
+			if (c == '\n')
+			{
+				AppendConsoleRow(*src);
+				src->line.clear();
+			}
+			else
+				src->line.push_back(c);
+		}
+	}
+
+	// Writes the console files, once; a trailing partial line gets a row too. Runs before status.json.
+	static void WriteConsoleFiles()
+	{
+		std::string ee, iop, tsv;
+		{
+			std::lock_guard lock(s_console_mutex);
+			if (s_console_written || !s_console_capture)
+				return;
+			s_console_written = true;
+			s_console_capture = false;
+
+			for (const ConsoleSource* src : {&s_console_ee, &s_console_iop})
+			{
+				if (!src->line.empty())
+					AppendConsoleRow(*src);
+			}
+			ee = std::move(s_console_ee.text);
+			iop = std::move(s_console_iop.text);
+			tsv = std::move(s_console_tsv);
+		}
+
+		const struct
+		{
+			const char* name;
+			const std::string& contents;
+		} files[] = {{"ee-console.txt", ee}, {"iop-console.txt", iop}, {"console.tsv", tsv}};
+		for (const auto& file : files)
+		{
+			const std::string path = Path::Combine(s_spec.output_dir, file.name);
+			if (!FileSystem::WriteStringToFile(path.c_str(), file.contents))
+			{
+				Console.Error("Oracle: FAIL: could not write '%s'", path.c_str());
+				RecordFailure(fmt::format("could not write '{}'", path));
+			}
+		}
+	}
+
 	void Fail(std::string_view reason)
 	{
 		Console.Error("Oracle: FAIL: %.*s", static_cast<int>(reason.size()), reason.data());
@@ -484,6 +611,8 @@ namespace Oracle
 	{
 		if (!s_end_frame_reached.load(std::memory_order_acquire))
 			RecordFailure("VM stopped before EndFrame was reached");
+
+		WriteConsoleFiles(); // before status.json, which must be the last file written
 
 		std::lock_guard lock(s_mutex);
 		if (s_status_written)

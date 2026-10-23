@@ -6,6 +6,7 @@
 #include "common/Console.h"
 #include "Config.h"
 #include "Memory.h"
+#include "Oracle.h"
 
 #include <string>
 
@@ -99,6 +100,9 @@ public:
 
 	bool Write(std::string_view msg)
 	{
+		if (Oracle::IsEnabled())
+			Oracle::OnVMConsole(Descriptor.Prefix, msg);
+
 		for (const char ch : msg)
 		{
 			// Ignore control characters.

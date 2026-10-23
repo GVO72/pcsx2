@@ -40,11 +40,15 @@ namespace Oracle
 	/// Counts boot vsyncs until the anchor, then oracle frames, and stops the VM after EndFrame.
 	void OnVSyncCPU();
 
+	/// Called for every piece of text the guest writes to its EE or IOP console (prefix "EEout",
+	/// "DECI2" or "IOPout"), after PCSX2's character set conversion. Safe to call from any thread.
+	void OnVMConsole(std::string_view prefix, std::string_view text);
+
 	/// Records a failure and requests that the VM (and the application) shut down. Thread-safe.
 	/// Only the first reason is kept.
 	void Fail(std::string_view reason);
 
-	/// Called from VMManager::Shutdown, after the GS thread is idle. Writes status.json.
+	/// Called from VMManager::Shutdown, after the GS thread is idle. Writes the console files, then status.json.
 	void OnVMShutdown();
 
 	/// Called by the host when the process is about to exit. Writes status.json if the VM never
